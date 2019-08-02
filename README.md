@@ -6,9 +6,9 @@ Requirements:
  - Linux
  - Python 3
 
-Create a virtual env: `python3 -m venv venv`
-Install requirements `source venv/bin/activate && pip install -r requirements.txt`
-Run command: `python splitencfs.py`
+1. Create a virtual env: `python3 -m venv venv`
+1. Install requirements `source venv/bin/activate && pip install -r requirements.txt`
+1. Run command: `python splitencfs.py`
 
 ```
 usage: splitencfs.py [-h] mount store
