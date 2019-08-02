@@ -5,16 +5,21 @@ import sys
 import errno
 import hashlib
 from collections import defaultdict
+from io import BytesIO
 
 from fuse import FUSE, FuseOSError, Operations
 from stat import S_IFDIR, S_IFLNK, S_IFREG
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import padding
 
 from datetime import datetime
 from time import time
 import json
+import getpass
 
 
 files = {
@@ -64,15 +69,65 @@ def _read_chunks(chunks, key):
     return data
 
 
+def _derive_key(password, salt=None):
+    if not salt:
+        salt = os.urandom(16)
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend()
+    )
+    key = kdf.derive(password)
+    return key, salt
+
+
+def _load_fat(path, password):
+    with open(path, 'rb') as fat_file:
+        salt = fat_file.read(16)
+        iv = fat_file.read(16)
+        encrypted_fat = fat_file.read()
+
+    key, _ = _derive_key(password, salt)
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_fat = decryptor.update(encrypted_fat) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    fat = unpadder.update(padded_fat) + unpadder.finalize()
+
+    return fat, key, salt
+
+
+def _save_fat(path, fat, key, salt):
+    """ fat should be bytes """
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(fat) + padder.finalize()
+
+    encrypted_fat = encryptor.update(padded_data) + encryptor.finalize()
+
+    with open(path, 'wb') as fat_file:
+        fat_file.write(salt)
+        fat_file.write(iv)
+        fat_file.write(encrypted_fat)
+
+
 class Passthrough(Operations):
     def __init__(self, root):
         self.root = root
-        # open allocation table
         fat_path = os.path.join(root, 'fat.json')
+        password = getpass.getpass().encode('utf-8')
         if os.path.isfile(fat_path):
-            with open(fat_path) as fat_file:
-                self.fat = json.load(fat_file)
+            encoded_fat, self.key, self.salt =_load_fat(fat_path, password)
+            self.fat = json.load(BytesIO(encoded_fat))
         else:
+            self.key, self.salt = _derive_key(password)
             self.fat = {
                 '/': {
                     'meta': dict(
@@ -87,11 +142,14 @@ class Passthrough(Operations):
         self.open_files = self.fat
 
     def destroy(self, path):
+        # TODO - should store file data as part of fat
+        for f in self.fat:
+            if 'data' in self.fat[f]:
+                del self.fat[f]['data']
+
         fat_path = os.path.join(self.root, 'fat.json')
-        with open(fat_path, 'w') as fat_file:
-            for f in self.fat:
-                self.fat[f]['data'] = None
-            json.dump(self.fat, fat_file)
+        encoded_fat = json.dumps(self.fat).encode('utf-8')
+        _save_fat(fat_path, encoded_fat, self.key, self.salt)
 
     # Filesystem methods
     # ==================
@@ -272,4 +330,10 @@ def main(mountpoint, store):
     FUSE(Passthrough(store), mountpoint, nothreads=True, foreground=True)
 
 if __name__ == '__main__':
-    main(sys.argv[1], sys.argv[2])
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mount')
+    parser.add_argument('store')
+    args = parser.parse_args()
+
+    main(args.mount, args.store)
