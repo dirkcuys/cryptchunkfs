@@ -118,14 +118,16 @@ def _save_fat(path, fat, key, salt):
         fat_file.write(encrypted_fat)
 
 
-class Passthrough(Operations):
-    def __init__(self, root):
+class CryptChunkFS(Operations):
+    def __init__(self, root, chunk_size=512):
         self.root = root
+        self.chunk_size = chunk_size
         fat_path = os.path.join(root, 'fat.json')
         password = getpass.getpass().encode('utf-8')
         if os.path.isfile(fat_path):
             encoded_fat, self.key, self.salt =_load_fat(fat_path, password)
             self.fat = json.load(BytesIO(encoded_fat))
+            # TODO should load chunk size from here
         else:
             self.key, self.salt = _derive_key(password)
             self.fat = {
@@ -142,7 +144,7 @@ class Passthrough(Operations):
         self.open_files = self.fat
 
     def destroy(self, path):
-        # TODO - should store file data as part of fat
+        # TODO - shouldn't store file data as part of fat
         for f in self.fat:
             if 'data' in self.fat[f]:
                 del self.fat[f]['data']
@@ -208,7 +210,10 @@ class Passthrough(Operations):
 
     @debug
     def rename(self, old, new):
-        pass
+        if old not in self.fat:
+            raise FuseOSError(errno.ENOENT)
+        self.fat[new] = self.fat[old]
+        del self.fat[old]
 
 #   @debug
 #   def link(self, target, name):
@@ -258,31 +263,27 @@ class Passthrough(Operations):
         encryptor = cipher.encryptor()
         encrypted_chunk = encryptor.update(chunk) + encryptor.finalize()
         chunk_hash = hashlib.sha1(encrypted_chunk).hexdigest()
+        # TODO should this hash include the iv??
         with open(os.path.join(self.root, chunk_hash), 'wb') as cf:
             cf.write(iv)
             cf.write(encrypted_chunk)
         return chunk_hash
 
-
     @debug
     def _write_complete_chunks(self, path):
-        # lets ignore updates
-        chunk_size = 512
+        chunk_size = self.chunk_size
         file_dict = self.open_files[path]
         cc = len(file_dict['data'])//chunk_size
         chunks = file_dict.get('chunks', [])
         for i in range(len(chunks), cc):
             chunk_data = file_dict['data'][i*chunk_size:i*chunk_size+chunk_size]
             chunk_hash = self._encrypt_and_write_chunk(path, chunk_data)
-            #hashlib.sha1(chunk_data).hexdigest()
-            #with open(os.path.join(self.root, chunk_hash), 'wb') as cf:
-            #    cf.write(chunk_data)
             chunks += [chunk_hash]
         file_dict['chunks'] = chunks
 
     def _flush_chunks(self, path):
         """ write last chunk to file padded with zeros """
-        chunk_size = 512
+        chunk_size = self.chunk_size
         self._write_complete_chunks(path)
         file_dict = self.open_files[path]
         chunks = file_dict['chunks']
@@ -301,7 +302,10 @@ class Passthrough(Operations):
             + buf \
             + file_dict['data'][offset+len(buf):]
         file_dict['meta']['st_size'] = len(file_dict['data'])
-        # TODO need to indicate if we're overwriting existing chunks!
+        # truncate any chunks that includes the offset or thereafter
+        chunks = file_dict.get('chunks', [])
+        prev_chunks = offset//self.chunk_size
+        file_dict['chunks'] = chunks[:prev_chunks]
         self._write_complete_chunks(path)
         return len(buf)
 
@@ -326,14 +330,13 @@ class Passthrough(Operations):
         pass
 
 
-def main(mountpoint, store):
-    FUSE(Passthrough(store), mountpoint, nothreads=True, foreground=True)
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('mount')
     parser.add_argument('store')
+    parser.add_argument("--chunk_size", help="display a square of a given number", type=int)
     args = parser.parse_args()
+    cryptchunkfs = CryptChunkFS(args.store, args.chunk_size if args.chunk_size else 512)
+    FUSE(cryptchunkfs, args.mount, nothreads=True, foreground=True)
 
-    main(args.mount, args.store)
